@@ -1,0 +1,340 @@
+trigger:
+- master
+
+variables:
+  serviceConnection: 'Service_connection-Test_LuisHernandez'
+  resourceGroupName: 'Test_LuisHernandez'
+  location: 'eastus2'
+  keyVaultName: 'kv-luishernandez-prueba'
+  vmName: 'vm-testluishernandez'
+  adminUsername: 'azureadmin'
+  storageAccountName: 'tfstateluishernandez'
+
+stages:
+
+- stage: PrepareInfrastructure
+  displayName: 'Prepare Infrastructure'
+  jobs:
+  - job: CreateResourceGroup
+    displayName: 'Create Resource Group and Storage'
+    steps:
+    - task: AzureCLI@2
+      displayName: 'Create Resource Group and Storage Account'
+      inputs:
+        azureSubscription: '$(serviceConnection)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          echo "Creating resource group if it doesn't exist..."
+          az group create --name $(resourceGroupName) --location $(location) --output none
+          
+          echo "Checking for existing storage account..."
+          if ! az storage account show --name $(storageAccountName) --resource-group $(resourceGroupName) &>/dev/null; then
+            echo "Creating storage account..."
+            az storage account create --name $(storageAccountName) --resource-group $(resourceGroupName) --location $(location) --sku Standard_LRS --output none
+            echo "Storage account created: $(storageAccountName)"
+            
+            echo "Creating container for Terraform state..."
+            az storage container create --name tfstate --account-name $(storageAccountName) --auth-mode login --output none
+          else
+            echo "Using existing storage account: $(storageAccountName)"
+          fi
+
+- stage: DeployInfrastructure
+  displayName: 'Deploy Infrastructure'
+  dependsOn: PrepareInfrastructure
+  jobs:
+  - job: Deploy
+    displayName: 'Deploy resources with Terraform'
+    steps:
+    - task: TerraformInstaller@0
+      displayName: 'Install Terraform'
+      inputs:
+        terraformVersion: '1.5.0'
+        
+    - task: TerraformTaskV2@2
+      displayName: 'Terraform Init'
+      inputs:
+        provider: 'azurerm'
+        command: 'init'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+        backendServiceArm: '$(serviceConnection)'
+        backendAzureRmResourceGroupName: '$(resourceGroupName)'
+        backendAzureRmStorageAccountName: '$(storageAccountName)'
+        backendAzureRmContainerName: 'tfstate'
+        backendAzureRmKey: 'terraform.tfstate'
+    
+    - task: TerraformTaskV2@2
+      displayName: 'Terraform Plan'
+      inputs:
+        provider: 'azurerm'
+        command: 'plan'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+        environmentServiceNameAzureRM: '$(serviceConnection)'
+        commandOptions: '-out=tfplan'
+
+    - task: Bash@3
+      displayName: 'Make script executable'
+      inputs:
+        targetType: 'inline'
+        script: |
+          chmod 755 $(System.DefaultWorkingDirectory)/terraform/scripts/set-keyvault-secrets.sh
+
+    - task: TerraformTaskV2@2
+      displayName: 'Terraform Apply'
+      inputs:
+        provider: 'azurerm'
+        command: 'apply'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+        environmentServiceNameAzureRM: '$(serviceConnection)'
+        commandOptions: 'tfplan'
+      
+    - task: AzureCLI@2
+      displayName: 'Get Key Vault and VM Info'
+      inputs:
+        azureSubscription: '$(serviceConnection)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          KEYVAULT_NAME=$(terraform -chdir=$(System.DefaultWorkingDirectory)/terraform output -raw key_vault_name)
+          USERNAME_SECRET=$(terraform -chdir=$(System.DefaultWorkingDirectory)/terraform output -raw vm_admin_username_secret_name)
+          PASSWORD_SECRET=$(terraform -chdir=$(System.DefaultWorkingDirectory)/terraform output -raw vm_admin_password_secret_name)
+          
+          echo "Key Vault Name: $KEYVAULT_NAME"
+          echo "Username Secret: $USERNAME_SECRET"
+          echo "Password Secret: $PASSWORD_SECRET"
+          
+          # You can securely retrieve the secrets if needed
+          VM_USERNAME=$(az keyvault secret show --vault-name $KEYVAULT_NAME --name $USERNAME_SECRET --query value -o tsv)
+          VM_PASSWORD=$(az keyvault secret show --vault-name $KEYVAULT_NAME --name $PASSWORD_SECRET --query value -o tsv)
+          
+          # Note: Be careful with outputting sensitive information in pipeline logs
+          echo "##vso[task.setvariable variable=vmUsername;isSecret=true]$VM_USERNAME"
+          echo "##vso[task.setvariable variable=vmPassword;isSecret=true]$VM_PASSWORD"
+
+- stage: Installpackages
+  displayName: 'Copy Scripts Installpackages'
+  jobs:
+  - job: DeployKeyVaultWithARM
+    displayName: 'Copy Scripts Installpackages'
+    pool:
+      vmImage: 'windows-latest'
+    steps:
+    - task: CopyFiles@2
+      displayName: 'Copy Scripts Installpackages'
+      inputs:
+        SourceFolder: '$(Build.SourcesDirectory)'
+        Contents: |
+          install_packages.ps1
+        TargetFolder: '$(Build.ArtifactStagingDirectory)'
+        
+- stage: SetupVM
+  displayName: 'Setup VM with Required Software'
+  jobs:
+  - job: InstallPackages
+    displayName: 'Install packages on VM'
+    pool:
+      vmImage: 'windows-latest'
+    steps:
+    - task: AzurePowerShell@5
+      displayName: 'Execute installation script on VM'
+      inputs:
+        azureSubscription: $(serviceConnection)
+        ScriptType: 'InlineScript'
+        Inline: |
+          # Save the script content to a file on the VM first
+          $scriptPath = "C:\install_packages.ps1"
+          
+          # Get the original script content
+          $scriptContent = Get-Content -Path "$(Build.SourcesDirectory)/install_packages.ps1" -Raw
+          
+          # Upload the script to the VM first
+          $uploadScript = "
+          # Creating script file
+          `$content = @'
+          $scriptContent
+          '@
+          
+          Set-Content -Path '$scriptPath' -Value `$content -Force
+          "
+          
+          # Upload the script to the VM
+          $uploadResult = Invoke-AzVMRunCommand -ResourceGroupName "$(resourceGroupName)" -VMName "$(vmName)" -CommandId 'RunPowerShellScript' -ScriptString $uploadScript
+          
+          # Display upload result
+          if ($uploadResult.Value.Count -gt 0) {
+            Write-Host "Script upload result: " 
+            $uploadResult.Value | ForEach-Object { Write-Host $_.Message }
+          }
+          
+          # Now execute the script directly on the VM
+          $executionScript = "
+          # Set execution policy
+          Set-ExecutionPolicy Bypass -Scope Process -Force
+          
+          # Run the script directly
+          & '$scriptPath'
+          
+          # Return the exit code
+          exit `$LASTEXITCODE
+          "
+          
+          # Execute the script on the VM
+          $result = Invoke-AzVMRunCommand -ResourceGroupName "$(resourceGroupName)" -VMName "$(vmName)" -CommandId 'RunPowerShellScript' -ScriptString $executionScript
+          
+          # Display result
+          $result.Value | ForEach-Object {
+            Write-Host $_.Message
+          }
+          
+          # Check for errors in output
+          if ($result.Value.Count -gt 0 -and $result.Value[0].Message -match "Exception|Error|Failed") {
+            Write-Host "##vso[task.logissue type=error]Installation script encountered errors."
+            Write-Host "##vso[task.complete result=Failed;]"
+          }
+        azurePowerShellVersion: 'LatestVersion'
+        pwsh: true
+            
+    - task: PowerShell@2
+      displayName: 'Wait for VM to restart'
+      inputs:
+        targetType: 'inline'
+        script: |
+          Write-Host "Waiting for VM to restart and services to come online (60 minute)..."
+          Start-Sleep -Seconds 60
+        pwsh: true
+
+- stage: KeyVaultAndPasswordManagement
+  displayName: 'Key Vault Management and Password Rotation'
+  jobs:
+  - job: UpdateKeyVaultAccess
+    displayName: 'Update Key Vault Access Policies'
+    pool:
+      vmImage: 'windows-latest'
+    steps:
+    - task: CopyFiles@2
+      displayName: 'Copy Scripts (Job Level)'
+      inputs:
+        SourceFolder: '$(Build.SourcesDirectory)'
+        Contents: |
+          update_kv_access_policy_1.ps1
+          update_kv_access_policy_2.ps1
+          update_kv_access_policy_3.ps1
+          update_kv_access_policy_4.ps1
+          update_kv_access_policy_5.ps1
+        TargetFolder: '$(Build.ArtifactStagingDirectory)'
+        OverWrite: true
+        
+    - task: AzurePowerShell@5
+      displayName: 'Update Key Vault Access Policy 1'
+      inputs:
+        azureSubscription: $(serviceConnection)
+        ScriptType: 'FilePath'
+        ScriptPath: '$(Build.ArtifactStagingDirectory)/update_kv_access_policy_1.ps1'
+        ScriptArguments: '-KeyVaultName "$(keyVaultName)" -ResourceGroupName "$(resourceGroupName)"'
+        azurePowerShellVersion: 'LatestVersion'
+        pwsh: true
+        
+    - task: AzurePowerShell@5
+      displayName: 'Update Key Vault Access Policy 2'
+      inputs:
+        azureSubscription: $(serviceConnection)
+        ScriptType: 'FilePath'
+        ScriptPath: '$(Build.ArtifactStagingDirectory)/update_kv_access_policy_2.ps1'
+        ScriptArguments: '-KeyVaultName "$(keyVaultName)" -ResourceGroupName "$(resourceGroupName)"'
+        azurePowerShellVersion: 'LatestVersion'
+        pwsh: true
+        
+    - task: AzurePowerShell@5
+      displayName: 'Update Key Vault Access Policy 3'
+      inputs:
+        azureSubscription: $(serviceConnection)
+        ScriptType: 'FilePath'
+        ScriptPath: '$(Build.ArtifactStagingDirectory)/update_kv_access_policy_3.ps1'
+        ScriptArguments: '-KeyVaultName "$(keyVaultName)" -ResourceGroupName "$(resourceGroupName)"'
+        azurePowerShellVersion: 'LatestVersion'
+        pwsh: true
+        
+    - task: AzurePowerShell@5
+      displayName: 'Update Key Vault Access Policy 4'
+      inputs:
+        azureSubscription: $(serviceConnection)
+        ScriptType: 'FilePath'
+        ScriptPath: '$(Build.ArtifactStagingDirectory)/update_kv_access_policy_4.ps1'
+        ScriptArguments: '-KeyVaultName "$(keyVaultName)" -ResourceGroupName "$(resourceGroupName)"'
+        azurePowerShellVersion: 'LatestVersion'
+        pwsh: true
+
+    - task: AzurePowerShell@5
+      displayName: 'Update Key Vault Access Policy 5'
+      inputs:
+        azureSubscription: $(serviceConnection)
+        ScriptType: 'FilePath'
+        ScriptPath: '$(Build.ArtifactStagingDirectory)/update_kv_access_policy_5.ps1'
+        ScriptArguments: '-KeyVaultName "$(keyVaultName)" -ResourceGroupName "$(resourceGroupName)"'
+        azurePowerShellVersion: 'LatestVersion'
+        pwsh: true
+
+    - task: AzurePowerShell@5
+      displayName: 'Execute Multiple Scripts'
+      inputs:
+        azureSubscription: $(serviceConnection)
+        ScriptType: 'InlineScript'
+        Inline: |
+          & "$(Build.ArtifactStagingDirectory)/update_kv_access_policy_1.ps1" -KeyVaultName "$(keyVaultName)" -ResourceGroupName "$(resourceGroupName)"
+          & "$(Build.ArtifactStagingDirectory)/update_kv_access_policy_2.ps1" -KeyVaultName "$(keyVaultName)" -ResourceGroupName "$(resourceGroupName)"
+          & "$(Build.ArtifactStagingDirectory)/update_kv_access_policy_3.ps1" -KeyVaultName "$(keyVaultName)" -ResourceGroupName "$(resourceGroupName)"
+          & "$(Build.ArtifactStagingDirectory)/update_kv_access_policy_4.ps1" -KeyVaultName "$(keyVaultName)" -ResourceGroupName "$(resourceGroupName)"
+          & "$(Build.ArtifactStagingDirectory)/update_kv_access_policy_5.ps1" -KeyVaultName "$(keyVaultName)" -ResourceGroupName "$(resourceGroupName)"
+        azurePowerShellVersion: 'LatestVersion'
+        pwsh: true
+
+- stage: CopyScripts
+  displayName: 'Copy Scripts Rotate Pass'
+  jobs:
+  - job: CopyScripts
+    displayName: 'Copy Scripts Rotate Pass'
+    pool:
+      vmImage: 'windows-latest'
+    steps:
+    - task: CopyFiles@2
+      displayName: 'Copy Scripts Rotate Pass'
+      inputs:
+        SourceFolder: '$(Build.SourcesDirectory)'
+        Contents: |
+          rotate_vm_password.ps1
+          verify_kv_access_policy.ps1
+        TargetFolder: '$(Build.ArtifactStagingDirectory)'
+    
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Artifacts'
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        ArtifactName: 'scripts'
+        publishLocation: 'Container'
+
+- stage: RotatePassword
+  displayName: 'Rotate VM Password'
+  dependsOn: CopyScripts
+  jobs:
+  - job: RotateVMPassword
+    displayName: 'Rotate VM Admin Password'
+    pool:
+      vmImage: 'windows-latest'
+    steps:
+    - task: DownloadBuildArtifacts@0
+      displayName: 'Download Scripts'
+      inputs:
+        buildType: 'current'
+        downloadType: 'single'
+        artifactName: 'scripts'
+        downloadPath: '$(System.ArtifactsDirectory)'
+        
+    - task: AzurePowerShell@5
+      displayName: 'Rotate VM Admin Password'
+      inputs:
+        azureSubscription: '$(serviceConnection)'
+        ScriptPath: '$(System.ArtifactsDirectory)/scripts/rotate_vm_password.ps1'
+        ScriptArguments: '-ResourceGroupName "$(resourceGroupName)" -VMName "$(vmName)" -KeyVaultName "$(keyVaultName)" -DefaultAdminUsername "$(adminUsername)"'
+        azurePowerShellVersion: 'LatestVersion'
+        pwsh: true

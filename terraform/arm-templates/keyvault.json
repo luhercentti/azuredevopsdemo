@@ -1,0 +1,86 @@
+{
+    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+      "keyVaultName": {
+        "type": "string",
+        "metadata": {
+          "description": "Name of the Key Vault"
+        }
+      },
+      "location": {
+        "type": "string",
+        "metadata": {
+          "description": "Location for the Key Vault"
+        }
+      },
+      "tenantId": {
+        "type": "string",
+        "metadata": {
+          "description": "Tenant ID for the Key Vault"
+        }
+      },
+      "objectId": {
+        "type": "string",
+        "metadata": {
+          "description": "Object ID of the service principal to grant permissions"
+        }
+      }
+    },
+    "resources": [
+      {
+        "type": "Microsoft.KeyVault/vaults",
+        "apiVersion": "2022-07-01",
+        "name": "[parameters('keyVaultName')]",
+        "location": "[parameters('location')]",
+        "properties": {
+          "enabledForDeployment": true,
+          "enabledForTemplateDeployment": true,
+          "enabledForDiskEncryption": true,
+          "tenantId": "[parameters('tenantId')]",
+          "accessPolicies": [
+            {
+              "tenantId": "[parameters('tenantId')]",
+              "objectId": "[parameters('objectId')]",
+              "permissions": {
+                "keys": [
+                  "Get",
+                  "List",
+                  "Create",
+                  "Delete",
+                  "Update"
+                ],
+                "secrets": [
+                  "Get",
+                  "List",
+                  "Set",
+                  "Delete"
+                ],
+                "certificates": [
+                  "Get",
+                  "List",
+                  "Create",
+                  "Delete"
+                ]
+              }
+            }
+          ],
+          "sku": {
+            "name": "standard",
+            "family": "A"
+          },
+          "softDeleteRetentionInDays": 7
+        }
+      }
+    ],
+    "outputs": {
+      "keyVaultId": {
+        "type": "string",
+        "value": "[resourceId('Microsoft.KeyVault/vaults', parameters('keyVaultName'))]"
+      },
+      "keyVaultUri": {
+        "type": "string",
+        "value": "[reference(resourceId('Microsoft.KeyVault/vaults', parameters('keyVaultName'))).vaultUri]"
+      }
+    }
+  }
